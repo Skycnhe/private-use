@@ -1,5 +1,3 @@
---- START OF FILE TW01.py ---
-
 import socket
 import re
 import time
