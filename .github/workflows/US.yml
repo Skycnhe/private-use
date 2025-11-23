@@ -1,10 +1,13 @@
 name: US
 
 on:
-  push:              # 每次 push 时触发
+  push:
   schedule:
-   - cron: '0 */1 * * *' # 每3小时运行一次
-  workflow_dispatch:      # 允许手动触发
+    - cron: '25 */1 * * *' # 错开25分钟执行
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-script:
@@ -19,12 +22,10 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt || true
+        run: pip install -r requirements.txt || true
 
-      - name: Run script and save output
-        run: |
-          python py/US.py > US.txt
+      - name: Run script
+        run: python py/US.py
 
       - name: Commit result
         run: |
