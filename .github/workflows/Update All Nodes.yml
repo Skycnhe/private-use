@@ -1,0 +1,63 @@
+name: Update All Nodes
+
+on:
+  push:
+  schedule:
+    - cron: '0 */1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-nodes:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - country: HK
+            file: py/HK.py
+            output: HK.txt
+          - country: JP
+            file: py/JP.py
+            output: JP.txt
+          - country: SG
+            file: py/SG.py
+            output: SG.txt
+          - country: DE
+            file: py/DE.py
+            output: DE.txt
+          - country: NL
+            file: py/NL.py
+            output: NL.txt
+          - country: TW
+            file: py/TW.py
+            output: TW.txt
+          - country: KR
+            file: py/KR.py
+            output: KR.txt
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt || true
+
+      - name: Run script for ${{ matrix.country }}
+        run: python ${{ matrix.file }}
+
+      - name: Commit result
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase # 防止多线程提交冲突
+          git add ${{ matrix.output }}
+          git commit -m "Auto update ${{ matrix.output }} [skip ci]" || echo "No changes to commit"
+          git push
