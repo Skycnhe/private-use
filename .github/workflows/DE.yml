@@ -3,8 +3,15 @@ name: DE
 on:
   push:              # 每次 push 时触发
   schedule:
-   - cron: '0 */1 * * *' # 每3小时运行一次
+   - cron: '0 */1 * * *' # 每1小时运行一次 (注意：你写的 */1 是每小时，原注释写每3小时可能笔误)
   workflow_dispatch:      # 允许手动触发
+
+# ==================================================
+# 关键修改：添加写入权限配置
+# 这解决了 "Write access to repository not granted" 错误
+# ==================================================
+permissions:
+  contents: write
 
 jobs:
   run-script:
@@ -23,8 +30,10 @@ jobs:
           pip install -r requirements.txt || true
 
       - name: Run script and save output
+        # 注意：如果 DE.py 内部已经有写入文件的代码，建议去掉 "> DE.txt"
+        # 否则 Python 的 print 输出（包括日志）会被写入文件，可能导致格式混乱
         run: |
-          python py/DE.py > DE.txt
+          python py/DE.py
 
       - name: Commit result
         run: |
