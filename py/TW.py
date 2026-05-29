@@ -2,45 +2,35 @@ import socket
 import re
 import time
 import threading
-import ipaddress  # 引入处理IP段的库
+import ipaddress
 from queue import Queue
 from datetime import datetime
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# Cloudflare节点测试配置参数
-TEST_TIMEOUT = 1.5  # 降低超时时间，提高扫描速度
+# ================= 配置参数 =================
+TEST_TIMEOUT = 1.5  
 TEST_PORT = 443   
-MAX_THREADS = 50    # 增加线程数，否则测不完正常的IP段
+MAX_THREADS = 100   # 建议增加到 100，提高效率
 TOP_NODES = 20    
 TXT_OUTPUT_FILE = "TW.txt"
 
-COUNTRY_CODES = {
-    'US': '美国', 'CN': '中国', 'JP': '日本', 'SG': '新加坡', 'KR': '韩国',
-    'GB': '英国', 'FR': '法国', 'DE': '德国', 'AU': '澳大利亚', 'CA': '加拿大',
-    'HK': '中国香港', 'TW': '中国台湾', 'IN': '印度', 'RU': '俄罗斯', 'Unknown': '未知'
-}
-
-def get_ip_country(ip):
-    """获取IP地址对应的国家信息"""
-    try:
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            code = data.get('countryCode', 'Unknown')
-            return COUNTRY_CODES.get(code, code)
-        return '未知'
-    except:
-        return '未知'
-
-def clean_ip(ip_str):
-    ip_str = ip_str.strip().split('#')[0].split(':')[0]
-    pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
-    if re.match(pattern, ip_str):
-        return ip_str
-    return None
+# Cloudflare 官方 IPv4 网段
+CF_IPV4_RANGES = [
+    '173.245.48.0/20',
+    '103.21.244.0/22',
+    '103.22.200.0/22',
+    '103.31.4.0/22',
+    '141.101.64.0/18',
+    '108.162.192.0/18',
+    '190.93.240.0/20',
+    '188.114.96.0/20',
+    '197.234.240.0/22',
+    '198.41.128.0/17',
+    '162.158.0.0/15',
+    '104.16.0.0/12',
+    '172.64.0.0/13',
+    '131.0.72.0/22'
+]
 
 class CloudflareNodeTester:
     def __init__(self):
@@ -49,58 +39,42 @@ class CloudflareNodeTester:
         self.lock = threading.Lock()
     
     def fetch_known_nodes(self):
-        """生成Cloudflare官方标准的IPv4节点列表"""
-        # 修改点：更新为官方最新的 IPv4 网段列表
-        cf_ipv4_ranges = [
-            '173.245.48.0/20',
-            '103.21.244.0/22',
-            '103.22.200.0/22',
-            '103.31.4.0/22',
-            '141.101.64.0/18',
-            '108.162.192.0/18',
-            '190.93.240.0/20',
-            '188.114.96.0/20',
-            '197.234.240.0/22',
-            '198.41.128.0/17',
-            '162.158.0.0/15',
-            '104.16.0.0/12',
-            '172.64.0.0/13',
-            '131.0.72.0/22'
-        ]
-        
-        print(f"正在从 {len(cf_ipv4_ranges)} 个官方网段中生成测试样本...")
-        
-        for cidr in cf_ipv4_ranges:
-            net = ipaddress.ip_network(cidr)
-            # 逻辑：从每个定义的网段中均匀抽取一部分IP进行探测
-            # 如果网段很小，多取点；网段很大（如/12），按大步长取样
-            if net.num_addresses <= 1024:
-                step = 10 
-            elif net.num_addresses <= 65536:
-                step = 128 
-            else:
-                step = 512 # 针对 104.16/12 等超大网段，增加步长以防样本过载
-            
-            count = 0
-            for i in range(1, net.num_addresses, step):
-                self.nodes.add(str(net[i]))
-                count += 1
+        """生成待测IP样本"""
+        print(f"[*] 正在从 {len(CF_IPV4_RANGES)} 个官方网段中生成样本...")
+        for cidr in CF_IPV4_RANGES:
+            try:
+                net = ipaddress.ip_network(cidr)
+                # 采样逻辑
+                if net.num_addresses <= 1024:
+                    step = 8
+                elif net.num_addresses <= 65536:
+                    step = 128
+                else:
+                    step = 512
                 
-            # 针对经常出现优选节点的特定段，额外增加一些样本
-            if "104.16" in cidr or "172.64" in cidr:
-                 for j in range(1, 15): self.nodes.add(str(net[j]))
+                # 遍历网段进行采样
+                for i in range(1, net.num_addresses, step):
+                    self.nodes.add(str(net[i]))
+                
+                # 针对核心段增加额外样本
+                if "104.16" in cidr or "172.64" in cidr:
+                    for j in range(1, 10):
+                        self.nodes.add(str(net[j]))
+            except Exception as e:
+                print(f"解析网段 {cidr} 出错: {e}")
 
-        print(f"生成了 {len(self.nodes)} 个待测节点。")
+        print(f"[*] 生成了 {len(self.nodes)} 个待测节点")
 
     def test_node_speed(self, ip):
+        """TCP 握手测速"""
         try:
             start_time = time.time()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(TEST_TIMEOUT)
                 result = s.connect_ex((ip, TEST_PORT))
                 if result == 0:
-                    response_time = (time.time() - start_time) * 1000
-                    return {'ip': ip, 'reachable': True, 'response_time_ms': int(response_time)}
+                    latency = (time.time() - start_time) * 1000
+                    return {'ip': ip, 'reachable': True, 'latency': int(latency)}
         except:
             pass
         return {'ip': ip, 'reachable': False}
@@ -110,6 +84,57 @@ class CloudflareNodeTester:
             ip = queue.get()
             result = self.test_node_speed(ip)
             if result['reachable']:
+                with self.lock:
+                    self.results.append(result)
+                    if len(self.results) % 50 == 0:
+                        print(f"[+] 已发现 {len(self.results)} 个可用节点...")
+            queue.task_done()
+
+    def run(self):
+        start_time = time.time()
+        self.fetch_known_nodes()
+        
+        task_queue = Queue()
+        for ip in self.nodes:
+            task_queue.put(ip)
+        
+        print(f"[*] 开始测速，线程数: {MAX_THREADS}...")
+        threads = []
+        for _ in range(MAX_THREADS):
+            # 修复：thread.setDaemon(True) 在新版本中已弃用，改为 daemon 属性
+            t = threading.Thread(target=self.worker, args=(task_queue,))
+            t.daemon = True 
+            t.start()
+            threads.append(t)
+        
+        task_queue.join()
+        
+        # 排序并保存
+        sorted_nodes = sorted(self.results, key=lambda x: x['latency'])
+        self.save_results(sorted_nodes)
+        print(f"[*] 总耗时: {int(time.time() - start_time)}秒")
+
+    def save_results(self, results):
+        count = min(len(results), TOP_NODES)
+        try:
+            with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                for i in range(count):
+                    node = results[i]
+                    # 严格执行你要求的格式
+                    f.write(f"{node['ip']}#tw 【中国台湾】 TW\n")
+            print(f"[*] 结果已保存至 {TXT_OUTPUT_FILE}，共 {count} 个")
+        except Exception as e:
+            print(f"保存文件出错: {e}")
+
+if __name__ == "__main__":
+    # 确保安装了 requests: pip install requests
+    try:
+        tester = CloudflareNodeTester()
+        tester.run()
+    except KeyboardInterrupt:
+        print("\n[!] 用户停止运行")
+    except Exception as e:
+        print(f"[!] 程序运行错误: {e}")            if result['reachable']:
                 with self.lock:
                     self.results.append(result)
                     if len(self.results) % 50 == 0:
