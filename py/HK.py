@@ -4,32 +4,21 @@ import time
 import threading
 import ipaddress
 from queue import Queue
-from datetime import datetime
-import requests
 
 # ================= 配置参数 =================
-TEST_TIMEOUT = 1.5   # 延迟测试超时(秒)
-TEST_PORT = 443      # 目标端口
-MAX_THREADS = 100    # 并发线程数
-TOP_NODES = 20       # 最终保存的最快节点数量
+TEST_TIMEOUT = 1.0   # GitHub Runner 网络较快，1秒足以判断是否为优选
+TEST_PORT = 443      
+MAX_THREADS = 50     # GitHub Actions 建议不要超过 50 线程，防止被限制
+TOP_NODES = 20       
 TXT_OUTPUT_FILE = "HK.txt"
 
-# Cloudflare 官方 IPv4 全量网段
+# Cloudflare 官方 IPv4 网段
 CF_IPV4_RANGES = [
-    '173.245.48.0/20',
-    '103.21.244.0/22',
-    '103.22.200.0/22',
-    '103.31.4.0/22',
-    '141.101.64.0/18',
-    '108.162.192.0/18',
-    '190.93.240.0/20',
-    '188.114.96.0/20',
-    '197.234.240.0/22',
-    '198.41.128.0/17',
-    '162.158.0.0/15',
-    '104.16.0.0/12',
-    '172.64.0.0/13',
-    '131.0.72.0/22'
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
+    '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
+    '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22',
+    '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/12',
+    '172.64.0.0/13', '131.0.72.0/22'
 ]
 
 class CloudflareNodeTester:
@@ -39,34 +28,24 @@ class CloudflareNodeTester:
         self.lock = threading.Lock()
     
     def fetch_known_nodes(self):
-        """智能采样生成待测IP"""
-        print(f"[*] 正在解析 {len(CF_IPV4_RANGES)} 个官方网段...")
+        print(f"[*] 正在解析官方网段...")
         for cidr in CF_IPV4_RANGES:
             try:
                 net = ipaddress.ip_network(cidr)
-                # 根据子网掩码大小决定采样步长 (step)
-                # 防止 /12 等大型网段产生数十万个测试任务
                 if net.num_addresses <= 1024:
                     step = 8
                 elif net.num_addresses <= 65536:
-                    step = 128
+                    step = 256
                 else:
-                    step = 512  # 大网段每 512 个 IP 取一个样本
+                    step = 1024
                 
                 for i in range(1, net.num_addresses, step):
                     self.nodes.add(str(net[i]))
-                
-                # 针对核心段额外补充头部样本（通常是网关或高频使用段）
-                if "104.16" in cidr or "172.64" in cidr:
-                    for j in range(1, 15):
-                        self.nodes.add(str(net[j]))
-            except Exception as e:
-                print(f"[!] 解析网段 {cidr} 出错: {e}")
-
+            except:
+                continue
         print(f"[*] 样本生成完毕: {len(self.nodes)} 个待测节点")
 
     def test_node_speed(self, ip):
-        """测试连接延迟"""
         try:
             start_time = time.time()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -80,29 +59,23 @@ class CloudflareNodeTester:
         return {'ip': ip, 'reachable': False}
 
     def worker(self, queue):
-        """线程工作函数"""
         while not queue.empty():
             ip = queue.get()
             result = self.test_node_speed(ip)
             if result['reachable']:
                 with self.lock:
                     self.results.append(result)
-                    if len(self.results) % 50 == 0:
-                        print(f"[+] 已发现 {len(self.results)} 个可用节点...")
             queue.task_done()
 
     def run(self):
-        start_time = time.time()
         self.fetch_known_nodes()
-        
         task_queue = Queue()
         for ip in self.nodes:
             task_queue.put(ip)
         
-        print(f"[*] 开始测速，线程并发: {MAX_THREADS}...")
+        print(f"[*] 开始测速...")
         threads = []
         for _ in range(MAX_THREADS):
-            # 修复点：将 setDaemon 改为现代属性 daemon=True
             t = threading.Thread(target=self.worker, args=(task_queue,))
             t.daemon = True 
             t.start()
@@ -110,6 +83,19 @@ class CloudflareNodeTester:
         
         task_queue.join()
         
+        sorted_nodes = sorted(self.results, key=lambda x: x['latency'])
+        self.save_results(sorted_nodes)
+
+    def save_results(self, results):
+        count = min(len(results), TOP_NODES)
+        with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+            for i in range(count):
+                node = results[i]
+                f.write(f"{node['ip']}#hk 【中国香港】 HK\n")
+        print(f"[*] 结果已保存至 {TXT_OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    CloudflareNodeTester().run()        
         # 按延迟从低到高排序
         sorted_nodes = sorted(self.results, key=lambda x: x['latency'])
         self.save_results(sorted_nodes)
