@@ -2,114 +2,144 @@ import socket
 import re
 import time
 import threading
+import ipaddress
 from queue import Queue
 from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import requests
 
-# Cloudflare节点测试配置参数
-TEST_TIMEOUT = 3  # 测试超时时间(秒)
-TEST_PORT = 443   # 测试端口
-MAX_THREADS = 3  # 最大线程数
-TOP_NODES = 20    # 显示和保存前N个最快节点
-TXT_OUTPUT_FILE = "HK.txt"    # TXT结果保存文件
+# ================= 配置参数 =================
+TEST_TIMEOUT = 1.5   # 延迟测试超时(秒)
+TEST_PORT = 443      # 目标端口
+MAX_THREADS = 100    # 并发线程数
+TOP_NODES = 20       # 最终保存的最快节点数量
+TXT_OUTPUT_FILE = "HK.txt"
 
-# 国家代码到中文国家名称的映射
-COUNTRY_CODES = {
-    'US': '美国',
-    'CN': '中国',
-    'JP': '日本',
-    'SG': '新加坡',
-    'KR': '韩国',
-    'GB': '英国',
-    'FR': '法国',
-    'DE': '德国',
-    'AU': '澳大利亚',
-    'CA': '加拿大',
-    'HK': '中国香港',
-    'TW': '中国台湾',
-    'IN': '印度',
-    'RU': '俄罗斯',
-    'BR': '巴西',
-    'MX': '墨西哥',
-    'NL': '荷兰',
-    'SE': '瑞典',
-    'CH': '瑞士',
-    'IT': '意大利',
-    'ES': '西班牙',
-    'Unknown': '未知'
-}
+# Cloudflare 官方 IPv4 全量网段
+CF_IPV4_RANGES = [
+    '173.245.48.0/20',
+    '103.21.244.0/22',
+    '103.22.200.0/22',
+    '103.31.4.0/22',
+    '141.101.64.0/18',
+    '108.162.192.0/18',
+    '190.93.240.0/20',
+    '188.114.96.0/20',
+    '197.234.240.0/22',
+    '198.41.128.0/17',
+    '162.158.0.0/15',
+    '104.16.0.0/12',
+    '172.64.0.0/13',
+    '131.0.72.0/22'
+]
 
-# IP地理位置查询函数
-def get_ip_country(ip):
-    """获取IP地址对应的国家信息(返回中文)"""
+class CloudflareNodeTester:
+    def __init__(self):
+        self.nodes = set()
+        self.results = []
+        self.lock = threading.Lock()
+    
+    def fetch_known_nodes(self):
+        """智能采样生成待测IP"""
+        print(f"[*] 正在解析 {len(CF_IPV4_RANGES)} 个官方网段...")
+        for cidr in CF_IPV4_RANGES:
+            try:
+                net = ipaddress.ip_network(cidr)
+                # 根据子网掩码大小决定采样步长 (step)
+                # 防止 /12 等大型网段产生数十万个测试任务
+                if net.num_addresses <= 1024:
+                    step = 8
+                elif net.num_addresses <= 65536:
+                    step = 128
+                else:
+                    step = 512  # 大网段每 512 个 IP 取一个样本
+                
+                for i in range(1, net.num_addresses, step):
+                    self.nodes.add(str(net[i]))
+                
+                # 针对核心段额外补充头部样本（通常是网关或高频使用段）
+                if "104.16" in cidr or "172.64" in cidr:
+                    for j in range(1, 15):
+                        self.nodes.add(str(net[j]))
+            except Exception as e:
+                print(f"[!] 解析网段 {cidr} 出错: {e}")
+
+        print(f"[*] 样本生成完毕: {len(self.nodes)} 个待测节点")
+
+    def test_node_speed(self, ip):
+        """测试连接延迟"""
+        try:
+            start_time = time.time()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(TEST_TIMEOUT)
+                result = s.connect_ex((ip, TEST_PORT))
+                if result == 0:
+                    latency = (time.time() - start_time) * 1000
+                    return {'ip': ip, 'reachable': True, 'latency': int(latency)}
+        except:
+            pass
+        return {'ip': ip, 'reachable': False}
+
+    def worker(self, queue):
+        """线程工作函数"""
+        while not queue.empty():
+            ip = queue.get()
+            result = self.test_node_speed(ip)
+            if result['reachable']:
+                with self.lock:
+                    self.results.append(result)
+                    if len(self.results) % 50 == 0:
+                        print(f"[+] 已发现 {len(self.results)} 个可用节点...")
+            queue.task_done()
+
+    def run(self):
+        start_time = time.time()
+        self.fetch_known_nodes()
+        
+        task_queue = Queue()
+        for ip in self.nodes:
+            task_queue.put(ip)
+        
+        print(f"[*] 开始测速，线程并发: {MAX_THREADS}...")
+        threads = []
+        for _ in range(MAX_THREADS):
+            # 修复点：将 setDaemon 改为现代属性 daemon=True
+            t = threading.Thread(target=self.worker, args=(task_queue,))
+            t.daemon = True 
+            t.start()
+            threads.append(t)
+        
+        task_queue.join()
+        
+        # 按延迟从低到高排序
+        sorted_nodes = sorted(self.results, key=lambda x: x['latency'])
+        self.save_results(sorted_nodes)
+        print(f"[*] 全程耗时: {int(time.time() - start_time)} 秒")
+
+    def save_results(self, results):
+        """保存为指定的 HK 格式"""
+        count = min(len(results), TOP_NODES)
+        try:
+            with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
+                for i in range(count):
+                    node = results[i]
+                    # 格式：IP#hk 【中国香港】 HK
+                    f.write(f"{node['ip']}#hk 【中国香港】 HK\n")
+            print(f"[*] 优选完成，结果已保存至 {TXT_OUTPUT_FILE}")
+            
+            # 屏幕打印前5个最快的结果
+            for i in range(min(5, count)):
+                print(f"优选: {results[i]['ip']} ({results[i]['latency']}ms)")
+        except Exception as e:
+            print(f"[!] 保存文件失败: {e}")
+
+if __name__ == "__main__":
     try:
-        # 验证IP格式
-        socket.inet_aton(ip)
-        
-        # 创建会话并配置重试机制
-        import requests
-        session = requests.Session()
-        retry = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        
-        # 尝试使用ipwhois.app API (不需要API密钥)
-        try:
-            url = f"https://ipwhois.app/json/{ip}"
-            response = session.get(url, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                if 'country' in data and data['country']:
-                    country = data['country']
-                    # 转换国家名称为中文
-                    if country == 'United States':
-                        return '美国'
-                    elif country == 'China':
-                        return '中国'
-                    elif country == 'Japan':
-                        return '日本'
-                    elif country == 'Singapore':
-                        return '新加坡'
-                    elif country == 'South Korea':
-                        return '韩国'
-                    elif country == 'United Kingdom':
-                        return '英国'
-                    elif country == 'France':
-                        return '法国'
-                    elif country == 'Germany':
-                        return '德国'
-                    elif country == 'Australia':
-                        return '澳大利亚'
-                    elif country == 'Canada':
-                        return '加拿大'
-                    elif country == 'Hong Kong':
-                        return '中国香港'
-                    elif country == 'Taiwan':
-                        return '中国台湾'
-                    # 如果是国家代码，尝试从映射中获取中文名称
-                    elif len(country) == 2:
-                        return COUNTRY_CODES.get(country, country)
-                    return country
-        except Exception as e:
-            print(f"ipwhois.app错误 {ip}: {str(e)}")
-        
-        # 尝试使用ip-api.com的备用端点 (使用HTTP而非HTTPS)
-        try:
-            url = f"http://ip-api.com/json/{ip}?fields=countryCode"
-            response = session.get(url, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success' and 'countryCode' in data:
-                    country_code = data['countryCode']
-                    # 从映射中获取中文国家名称
-                    return COUNTRY_CODES.get(country_code, country_code)
-        except Exception as e:
-            print(f"ip-api.com错误 {ip}: {str(e)}")
-        
-        # 基于IP地址范围的简单判断 (Cloudflare IP范围)
-        # 这些IP看起来是Cloudflare的IP地址
+        tester = CloudflareNodeTester()
+        tester.run()
+    except KeyboardInterrupt:
+        print("\n[!] 用户手动停止")
+    except Exception as e:
+        print(f"[!] 程序异常: {e}")        # 这些IP看起来是Cloudflare的IP地址
         octets = ip.split('.')
         if octets[0] == '104' and octets[1] == '18':
             return '美国'  # Cloudflare US IPs
