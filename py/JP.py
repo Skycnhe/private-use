@@ -25,12 +25,12 @@ class CloudflareScannerJP:
         self.results = []
 
     def generate_ips(self):
-        """解析网段并抽样生成待测 IP"""
+        """生成待测样本 IP"""
         print("[*] 正在解析官方网段并生成日本优选样本...")
         for cidr in CF_IPV4_RANGES:
             try:
                 network = ipaddress.ip_network(cidr)
-                # 抽样逻辑：大网段步长 128，小网段步长 16
+                # 步长抽样：大网段 128，小网段 16
                 step = 128 if network.num_addresses > 1024 else 16
                 for i in range(1, network.num_addresses, step):
                     self.ips.append(str(network[i]))
@@ -39,7 +39,7 @@ class CloudflareScannerJP:
         print(f"[*] 样本生成完毕，共有 {len(self.ips)} 个测试目标")
 
     def test_latency(self, ip):
-        """测试 TCP 握手延迟"""
+        """测试连接延迟"""
         try:
             start = time.perf_counter()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -78,7 +78,7 @@ class CloudflareScannerJP:
         self.save_top_nodes()
 
     def save_top_nodes(self):
-        """保存为指定格式"""
+        """按照要求的格式保存结果"""
         count = min(len(self.results), TOP_NODES)
         if count == 0:
             print("[!] 未发现可用节点")
@@ -92,10 +92,11 @@ class CloudflareScannerJP:
                     f.write(f"{node['ip']}#jp 【日本】 JP\n")
             
             print(f"[*] 结果已保存至 {TXT_OUTPUT_FILE}")
+            # 控制台只打印前5个最快的预览
             for i in range(min(5, count)):
                 print(f"  优选: {self.results[i]['ip']} ({self.results[i]['latency']}ms)")
         except Exception as e:
-            print(f"[!] 保存失败: {e}")
+            print(f"[!] 文件保存失败: {e}")
 
 if __name__ == "__main__":
     scanner = CloudflareScannerJP()
@@ -104,34 +105,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[!] 用户停止")
     except Exception as e:
-        print(f"\n[!] 程序运行出错: {e}")            country = "待查" if i > 5 else get_ip_country(node['ip'])
-            print(f"{node['ip']} - {node['response_time_ms']}ms - {country}")
-        return sorted_nodes
-
-    def save_results(self, results):
-        try:
-            top_results = results[:TOP_NODES]
-            with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                for node in top_results:
-                    # 写入格式优化
-                    f.write(f"{node['ip']}:443#JP_Cloudflare_{node['response_time_ms']}ms\n")
-            print(f"\n结果已保存至 {TXT_OUTPUT_FILE}")
-        except Exception as e:
-            print(f"保存失败: {e}")
-
-def run_cloudflare_tester(self):
-    print("正在获取节点...")
-    self.fetch_known_nodes()
-    print(f"开始测试 {len(self.nodes)} 个节点...")
-    self.test_all_nodes()
-    sorted_nodes = self.sort_and_display_results()
-    self.save_results(sorted_nodes)
-
-CloudflareNodeTester.run = run_cloudflare_tester
-
-if __name__ == "__main__":
-    try:
-        tester = CloudflareNodeTester()
-        tester.run()
-    except Exception as e:
-        print(f"程序运行崩溃: {e}")
+        print(f"\n[!] 程序运行出错: {e}")
