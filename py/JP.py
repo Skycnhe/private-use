@@ -1,115 +1,110 @@
 import socket
-import re
 import time
-import threading
-import requests  # 移动到顶部防止报错
-from queue import Queue
-from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Cloudflare节点测试配置参数
-TEST_TIMEOUT = 3  # 测试超时时间(秒)
-TEST_PORT = 443   # 测试端口
-MAX_THREADS = 10  # 稍微增加线程提高效率
-TOP_NODES = 50    # 显示和保存前N个最快节点
-TXT_OUTPUT_FILE = "JP.txt"    # TXT结果保存文件
-IP_COUNTRIES_FILE = "IP_Countries.txt" # 定义缺失的变量
+# ================= 配置参数 =================
+TEST_TIMEOUT = 1.0     # 连接超时时间（秒）
+TEST_PORT = 443        # 测试端口
+MAX_THREADS = 100      # 并发线程数
+TOP_NODES = 20         # 最终保留的优选数量
+TXT_OUTPUT_FILE = "JP.txt"
 
-# 国家代码到中文国家名称的映射
-COUNTRY_CODES = {
-    'US': '美国', 'CN': '中国', 'JP': '日本', 'SG': '新加坡', 'KR': '韩国',
-    'GB': '英国', 'FR': '法国', 'DE': '德国', 'AU': '澳大利亚', 'CA': '加拿大',
-    'HK': '中国香港', 'TW': '中国台湾', 'IN': '印度', 'RU': '俄罗斯', 'Unknown': '未知'
-}
+# Cloudflare 官方 IPv4 网段
+CF_IPV4_RANGES = [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
+    '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
+    '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22',
+    '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/12',
+    '172.64.0.0/13', '131.0.72.0/22'
+]
 
-def get_ip_country(ip):
-    """获取IP地址对应的国家信息(增加异常处理)"""
-    try:
-        session = requests.Session()
-        # 针对 Anycast IP，API 往往返回美国。为了防止请求过快被封，这里简单处理
-        url = f"http://ip-api.com/json/{ip}?fields=countryCode"
-        response = session.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            code = data.get('countryCode', 'Unknown')
-            return COUNTRY_CODES.get(code, code)
-        return '未知'
-    except:
-        return '查询失败'
-
-def clean_ip(ip_str):
-    ip_str = ip_str.strip().rstrip(':')
-    pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
-    if re.match(pattern, ip_str):
-        parts = ip_str.split('.')
-        if all(0 <= int(part) <= 255 for part in parts):
-            return ip_str
-    return None
-
-class CloudflareNodeTester:
+class CloudflareScannerJP:
     def __init__(self):
-        self.nodes = set()
+        self.ips = []
         self.results = []
-        self.lock = threading.Lock()
-    
-    def fetch_known_nodes(self):
-        # 针对中国电信优选日本/亚洲节点
-        ip_ranges = [
-            '104.16.0.0/12',
-            '172.64.0.0/13',
-            '162.159.0.0/16',
-            '108.162.192.0/18'
-        ]
-        for ip_range in ip_ranges:
-            base_ip = ip_range.split('/')[0]
-            octets = base_ip.split('.')
-            # 每个段抽样生成，避免基数过大
-            for i in range(1, 21): 
-                ip = f"{octets[0]}.{octets[1]}.{octets[2]}.{i}"
-                self.nodes.add(ip)
-    
-    def test_node_speed(self, ip):
+
+    def generate_ips(self):
+        """解析网段并抽样生成待测 IP"""
+        print("[*] 正在解析官方网段并生成日本优选样本...")
+        for cidr in CF_IPV4_RANGES:
+            try:
+                network = ipaddress.ip_network(cidr)
+                # 抽样逻辑：大网段步长 128，小网段步长 16
+                step = 128 if network.num_addresses > 1024 else 16
+                for i in range(1, network.num_addresses, step):
+                    self.ips.append(str(network[i]))
+            except:
+                continue
+        print(f"[*] 样本生成完毕，共有 {len(self.ips)} 个测试目标")
+
+    def test_latency(self, ip):
+        """测试 TCP 握手延迟"""
         try:
-            start_time = time.time()
+            start = time.perf_counter()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(TEST_TIMEOUT)
                 result = s.connect_ex((ip, TEST_PORT))
                 if result == 0:
-                    response_time = (time.time() - start_time) * 1000
-                    return {'ip': ip, 'reachable': True, 'response_time_ms': int(response_time)}
+                    latency = (time.perf_counter() - start) * 1000
+                    return {"ip": ip, "latency": int(latency)}
         except:
             pass
-        return {'ip': ip, 'reachable': False, 'response_time_ms': None}
-    
-    def worker(self, queue):
-        while not queue.empty():
-            ip = queue.get()
-            result = self.test_node_speed(ip)
-            with self.lock:
-                self.results.append(result)
-                if len(self.results) % 10 == 0:
-                    print(f"进度: {len(self.results)}/{len(self.nodes)}")
-            queue.task_done()
-    
-    def test_all_nodes(self):
-        queue = Queue()
-        for ip in self.nodes: queue.put(ip)
-        threads = []
-        for _ in range(min(MAX_THREADS, len(self.nodes))):
-            thread = threading.Thread(target=self.worker, args=(queue,))
-            thread.start()
-            threads.append(thread)
-        for thread in threads: thread.join()
-    
-    def sort_and_display_results(self):
-        reachable_nodes = [n for n in self.results if n['reachable']]
-        sorted_nodes = sorted(reachable_nodes, key=lambda x: x['response_time_ms'])
+        return None
+
+    def run(self):
+        self.generate_ips()
+        print(f"[*] 开始测速 (并发线程: {MAX_THREADS})...")
         
-        print("\n[最快节点列表]")
-        for i, node in enumerate(sorted_nodes[:TOP_NODES], 1):
-            # 注意：频繁查API会被封，这里只查前5个，其余标记
-            country = "待查" if i > 5 else get_ip_country(node['ip'])
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_ip = {executor.submit(self.test_latency, ip): ip for ip in self.ips}
+            
+            completed = 0
+            for future in as_completed(future_to_ip):
+                res = future.result()
+                if res:
+                    self.results.append(res)
+                
+                completed += 1
+                if completed % 500 == 0:
+                    print(f"    进度: {completed}/{len(self.ips)}...")
+
+        # 排序
+        self.results.sort(key=lambda x: x['latency'])
+        
+        duration = int(time.time() - start_time)
+        print(f"[*] 测速完成，耗时 {duration} 秒，有效节点 {len(self.results)} 个")
+        self.save_top_nodes()
+
+    def save_top_nodes(self):
+        """保存为指定格式"""
+        count = min(len(self.results), TOP_NODES)
+        if count == 0:
+            print("[!] 未发现可用节点")
+            return
+
+        try:
+            with open(TXT_OUTPUT_FILE, "w", encoding="utf-8") as f:
+                for i in range(count):
+                    node = self.results[i]
+                    # 格式：IP#jp 【日本】 JP
+                    f.write(f"{node['ip']}#jp 【日本】 JP\n")
+            
+            print(f"[*] 结果已保存至 {TXT_OUTPUT_FILE}")
+            for i in range(min(5, count)):
+                print(f"  优选: {self.results[i]['ip']} ({self.results[i]['latency']}ms)")
+        except Exception as e:
+            print(f"[!] 保存失败: {e}")
+
+if __name__ == "__main__":
+    scanner = CloudflareScannerJP()
+    try:
+        scanner.run()
+    except KeyboardInterrupt:
+        print("\n[!] 用户停止")
+    except Exception as e:
+        print(f"\n[!] 程序运行出错: {e}")            country = "待查" if i > 5 else get_ip_country(node['ip'])
             print(f"{node['ip']} - {node['response_time_ms']}ms - {country}")
         return sorted_nodes
 
