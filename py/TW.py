@@ -1,30 +1,16 @@
 import socket
 import time
-import threading
 import ipaddress
-import requests
-import os
-import sys
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 配置参数 =================
-TEST_TIMEOUT = 1.0       # TCP延迟测试超时(秒)
-HTTP_TIMEOUT = 1.5       # 获取地区信息的超时(秒)
-TEST_PORT = 443          # 测试端口
-MAX_THREADS = 100        # 并发线程数
-TARGET_PER_REGION = 30   # 每个地区收集多少个IP后停止（保存上限）
+TEST_TIMEOUT = 1.0     # 连接超时时间（秒）
+TEST_PORT = 443        # 测试端口
+MAX_THREADS = 100      # 并发线程数
+TOP_NODES = 20         # 最终保留的优选数量
+TXT_OUTPUT_FILE = "TW.txt"  # 修改为台湾文件名
 
-# 目标地区配置：完善了更多机房代码
-REGION_CONFIG = {
-    'JP': {'name': '日本', 'codes': ['NRT', 'KIX', 'FUK', 'NGO', 'HND'], 'file': 'JP.txt'},
-    'HK': {'name': '中国香港', 'codes': ['HKG'], 'file': 'HK.txt'},
-    'KR': {'name': '韩国', 'codes': ['ICN', 'PUS'], 'file': 'KR.txt'},
-    'TW': {'name': '中国台湾', 'codes': ['TPE', 'KHH'], 'file': 'TW.txt'},
-    'SG': {'name': '新加坡', 'codes': ['SIN'], 'file': 'SG.txt'},
-    'DE': {'name': '德国', 'codes': ['FRA', 'MUC', 'HAM', 'DUS', 'TXL', 'BER'], 'file': 'DE.txt'},
-    'US': {'name': '美国', 'codes': ['SJC', 'LAX', 'SFO', 'SEA', 'ORD', 'JFK', 'IAD', 'DFW', 'EWR', 'ATL'], 'file': 'US.txt'}
-}
-
+# Cloudflare 官方 IPv4 网段
 CF_IPV4_RANGES = [
     '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
     '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
@@ -33,83 +19,92 @@ CF_IPV4_RANGES = [
     '172.64.0.0/13', '131.0.72.0/22'
 ]
 
-class CloudflareMultiScanner:
+class CloudflareScannerTW:
     def __init__(self):
-        self.nodes = []
-        self.results = {reg: [] for reg in REGION_CONFIG}
-        self.counter = {reg: 0 for reg in REGION_CONFIG} # 用于显示进度
-        self.lock = threading.Lock()
-        self.start_time = 0
-        self.is_running = True
+        self.ips = []
+        self.results = []
 
-    def fetch_nodes(self):
-        """生成待测样本：更科学的散列抽样"""
-        print("[*] 正在解析 Cloudflare 全量网段并生成样本...")
+    def generate_ips(self):
+        """解析网段并抽样生成待测 IP"""
+        print("[*] 正在解析官方网段并生成台湾优选样本...")
         for cidr in CF_IPV4_RANGES:
-            net = ipaddress.ip_network(cidr)
-            # 根据网段大小动态调整步长
-            if net.num_addresses > 65536: step = 512
-            elif net.num_addresses > 4096: step = 128
-            else: step = 64
+            network = ipaddress.ip_network(cidr)
+            # 抽样逻辑：大网段每隔 128 个 IP 取一个，小网段每隔 16 个取一个
+            if network.num_addresses > 1024:
+                step = 128
+            else:
+                step = 16
             
-            # 每个网段内分散取样
-            for i in range(1, net.num_addresses, step):
-                self.nodes.append(str(net[i]))
-        print(f"[*] 样本生成完毕: {len(self.nodes)} 个候选节点")
+            for i in range(1, network.num_addresses, step):
+                self.ips.append(str(network[i]))
+        print(f"[*] 样本生成完毕，共有 {len(self.ips)} 个测试目标")
 
-    def get_ip_info(self, ip):
-        """核心探测逻辑：TCP延迟 + HTTP Trace机房识别"""
+    def test_latency(self, ip):
+        """测试 TCP 握手延迟"""
         try:
-            # 1. 延迟探测
-            s_time = time.time()
+            start = time.perf_counter()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(TEST_TIMEOUT)
-                if s.connect_ex((ip, TEST_PORT)) != 0:
-                    return None
-                latency = int((time.time() - s_time) * 1000)
-
-            # 2. 识别机房 (使用 HTTP 1.1 减少开销)
-            trace_url = f"http://{ip}/cdn-cgi/trace"
-            resp = requests.get(trace_url, headers={"Host": "da.gd"}, timeout=HTTP_TIMEOUT)
-            if resp.status_code == 200:
-                for line in resp.text.split('\n'):
-                    if line.startswith('colo='):
-                        return {'ip': ip, 'ms': latency, 'colo': line.split('=')[1]}
+                result = s.connect_ex((ip, TEST_PORT))
+                if result == 0:
+                    latency = (time.perf_counter() - start) * 1000
+                    return {"ip": ip, "latency": int(latency)}
         except:
             pass
         return None
 
-    def worker(self, q):
-        while not q.empty() and self.is_running:
-            ip = q.get()
-            info = self.get_ip_info(ip)
-            if info:
-                # 匹配预设地区
-                for reg_code, config in REGION_CONFIG.items():
-                    if info['colo'] in config['codes']:
-                        with self.lock:
-                            self.results[reg_code].append(info)
-                            self.counter[reg_code] += 1
-                            # 实时刷新进度条
-                            self.print_progress()
-                        break
-            q.task_done()
-
-    def print_progress(self):
-        """在同一行刷新显示各地区获取数量"""
-        stats = " | ".join([f"{k}:{v}" for k, v in self.counter.items()])
-        sys.stdout.write(f"\r[*] 发现节点 -> {stats} ")
-        sys.stdout.flush()
-
-    def save_results(self):
-        """任务结束，排序并保存"""
-        print("\n\n[*] 正在按延迟排序并保存结果...")
-        for reg_code, nodes in self.results.items():
-            if not nodes: continue
+    def run(self):
+        self.generate_ips()
+        print(f"[*] 开始测速 (并发线程: {MAX_THREADS})...")
+        
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_ip = {executor.submit(self.test_latency, ip): ip for ip in self.ips}
             
-            config = REGION_CONFIG[reg_code]
-            # 按延迟从低到高排序
-            sorted_nodes = sorted(nodes, key=lambda x: x['ms'])
+            completed = 0
+            for future in as_completed(future_to_ip):
+                res = future.result()
+                if res:
+                    self.results.append(res)
+                
+                completed += 1
+                if completed % 500 == 0:
+                    print(f"    进度: {completed}/{len(self.ips)}...")
+
+        # 按延迟从低到高排序
+        self.results.sort(key=lambda x: x['latency'])
+        
+        duration = int(time.time() - start_time)
+        print(f"[*] 测速完成，耗时 {duration} 秒，获得有效节点 {len(self.results)} 个")
+        self.save_top_nodes()
+
+    def save_top_nodes(self):
+        """保存为台湾格式"""
+        count = min(len(self.results), TOP_NODES)
+        if count == 0:
+            print("[!] 未发现可用节点。")
+            return
+
+        try:
+            with open(TXT_OUTPUT_FILE, "w", encoding="utf-8") as f:
+                for i in range(count):
+                    node = self.results[i]
+                    # 格式：IP#tw 【中国台湾】 TW
+                    f.write(f"{node['ip']}#tw 【中国台湾】 TW\n")
+            
+            print(f"[*] 优选完成，结果已保存至 {TXT_OUTPUT_FILE}")
+            print("\n延迟最低的前 5 个台湾备选节点:")
+            for i in range(min(5, count)):
+                print(f"  {self.results[i]['ip']} - {self.results[i]['latency']}ms")
+        except Exception as e:
+            print(f"[!] 保存失败: {e}")
+
+if __name__ == "__main__":
+    scanner = CloudflareScannerTW()
+    try:
+        scanner.run()
+    except KeyboardInterrupt:
+        print("\n[!] 用户停止")            sorted_nodes = sorted(nodes, key=lambda x: x['ms'])
             
             with open(config['file'], 'w', encoding='utf-8') as f:
                 for n in sorted_nodes[:TARGET_PER_REGION]:
