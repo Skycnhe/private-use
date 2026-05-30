@@ -1,5 +1,4 @@
 import socket
-import re
 import time
 import threading
 import ipaddress
@@ -7,11 +6,11 @@ import requests
 from queue import Queue
 
 # ================= 配置参数 =================
-TEST_TIMEOUT = 1.0   # 延迟测试超时(秒)
-TEST_PORT = 443      
-MAX_THREADS = 100    # 并发线程
-TARGET_COUNT = 50    # 目标收集多少个台湾IP
-TARGET_COUNTRY = "TW" # 筛选的国家代码
+TEST_TIMEOUT = 1.0       # 延迟测试超时(秒)
+TEST_PORT = 443          # 测试端口
+MAX_THREADS = 100        # 并发线程数
+TARGET_COUNT = 50        # 目标：收集多少个台湾IP后停止
+TARGET_COUNTRY = "TW"     # 目标国家代码
 TXT_OUTPUT_FILE = "TW.txt" 
 
 # Cloudflare 官方 IPv4 网段
@@ -24,10 +23,9 @@ CF_IPV4_RANGES = [
 ]
 
 def get_real_location(ip):
-    """识别IP归属地"""
+    """通过API识别IP归属地"""
     try:
-        # ip-api.com 免费版限制 45次/分钟
-        # 如果需要大规模查询，建议使用本地库（如 MaxMind）
+        # 使用 ip-api.com 免费接口 (每分钟限45次请求)
         url = f"http://ip-api.com/json/{ip}?fields=status,countryCode"
         resp = requests.get(url, timeout=5).json()
         if resp.get('status') == 'success':
@@ -36,19 +34,19 @@ def get_real_location(ip):
     except:
         return "Error"
 
-class CloudflareTester:
+class CloudflareTWScanner:
     def __init__(self):
         self.nodes = set()
         self.results = []
         self.lock = threading.Lock()
     
     def fetch_nodes(self):
-        """解析网段样本"""
+        """生成待测样本"""
         print("[*] 正在解析全量网段样本...")
         for cidr in CF_IPV4_RANGES:
             try:
                 net = ipaddress.ip_network(cidr)
-                # 采样步长：网段越大，步长越大，避免样本过多
+                # 根据网段大小智能采样，确保覆盖范围广
                 if net.num_addresses <= 1024:
                     step = 8
                 elif net.num_addresses <= 65536:
@@ -89,7 +87,7 @@ class CloudflareTester:
         for ip in self.nodes:
             q.put(ip)
 
-        print(f"[*] 开始测速（第一轮：筛选低延迟节点），线程数: {MAX_THREADS}...")
+        print(f"[*] 第一步：正在全球节点中筛选低延迟IP (线程: {MAX_THREADS})...")
         threads = []
         for _ in range(MAX_THREADS):
             t = threading.Thread(target=self.worker, args=(q,))
@@ -99,14 +97,13 @@ class CloudflareTester:
         
         q.join()
         
-        # 按照延迟从低到高排序
+        # 按延迟排序（最快的排在前面）
         sorted_nodes = sorted(self.results, key=lambda x: x['ms'])
         
-        print(f"[*] 开始识别归属地，目标：{TARGET_COUNTRY}，计划收集：{TARGET_COUNT}个...")
-        final_data = []
+        print(f"[*] 第二步：正在从低延迟节点中筛选 {TARGET_COUNTRY} 归属地...")
+        final_tw_list = []
         count = 0
         
-        # 遍历测速结果，查找符合国家代码的IP
         for node in sorted_nodes:
             if count >= TARGET_COUNT:
                 break
@@ -114,32 +111,34 @@ class CloudflareTester:
             code = get_real_location(node['ip'])
             
             if code == TARGET_COUNTRY:
+                count += 1
                 node['code'] = code.lower()
                 node['label'] = "中国台湾"
-                final_data.append(node)
-                count += 1
-                print(f"找到第 {count} 个台湾节点: {node['ip']} | {node['ms']}ms")
+                final_tw_list.append(node)
+                print(f"  [+] 命中台湾节点 #{count}: {node['ip']} ({node['ms']}ms)")
             
-            # 关键：ip-api 免费版有限制，每分钟最多45次
-            # 为了防止被封IP，这里增加一个小延迟，或者如果你有付费Key可以移除
+            # 关键：遵守免费API频率限制 (1.35秒一次请求，约每分钟44次)
+            # 如果你有付费IP库或API，可以移除此延迟
             time.sleep(1.35) 
 
-        if final_data:
-            self.save(final_data)
+        if final_tw_list:
+            self.save(final_tw_list)
         else:
-            print("[!] 未找到符合条件的台湾节点。")
+            print("[!] 扫描完成，但在样本中未发现台湾节点。")
 
     def save(self, data):
         with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
             for n in data:
-                # 格式：IP#code 【国家】 地区代码
+                # 按照 IP#code 【国家】 地区代码 格式输出
                 line = f"{n['ip']}#{n['code']} 【{n['label']}】 {n['code'].upper()}\n"
                 f.write(line)
-        print(f"[*] 成功保存 {len(data)} 个节点至 {TXT_OUTPUT_FILE}")
+        print(f"[*] 成功！已将 {len(data)} 个台湾节点保存至 {TXT_OUTPUT_FILE}")
 
 if __name__ == "__main__":
     try:
-        tester = CloudflareTester()
-        tester.run()
+        scanner = CloudflareTWScanner()
+        scanner.run()
+    except KeyboardInterrupt:
+        print("\n[!] 用户停止任务")
     except Exception as e:
-        print(f"[!] 程序异常退出: {e}")
+        print(f"[!] 程序异常: {e}")
