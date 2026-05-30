@@ -9,11 +9,12 @@ from queue import Queue
 # ================= 配置参数 =================
 TEST_TIMEOUT = 1.0   # 延迟测试超时(秒)
 TEST_PORT = 443      
-MAX_THREADS = 100    # GitHub Actions 建议 50-100
-TOP_NODES = 50       
-TXT_OUTPUT_FILE = "Global_IP.txt" 
+MAX_THREADS = 100    # 并发线程
+TARGET_COUNT = 50    # 目标收集多少个台湾IP
+TARGET_COUNTRY = "TW" # 筛选的国家代码
+TXT_OUTPUT_FILE = "TW.txt" 
 
-# Cloudflare 官方 IPv4 全量网段
+# Cloudflare 官方 IPv4 网段
 CF_IPV4_RANGES = [
     '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
     '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
@@ -22,26 +23,18 @@ CF_IPV4_RANGES = [
     '172.64.0.0/13', '131.0.72.0/22'
 ]
 
-# 国家映射表
-COUNTRY_LABELS = {
-    'HK': '中国香港', 'TW': '中国台湾', 'JP': '日本', 
-    'KR': '韩国', 'SG': '新加坡', 'US': '美国', 
-    'DE': '德国', 'CN': '中国'
-}
-
 def get_real_location(ip):
     """识别IP归属地"""
     try:
-        # ip-api.com 免费限速 45次/分钟，我们只查 TOP 节点，不会超限
+        # ip-api.com 免费版限制 45次/分钟
+        # 如果需要大规模查询，建议使用本地库（如 MaxMind）
         url = f"http://ip-api.com/json/{ip}?fields=status,countryCode"
         resp = requests.get(url, timeout=5).json()
         if resp.get('status') == 'success':
-            code = resp.get('countryCode')
-            label = COUNTRY_LABELS.get(code, code)
-            return code, label
-        return "Unknown", "未知区域"
+            return resp.get('countryCode')
+        return "Unknown"
     except:
-        return "Error", "查询失败"
+        return "Error"
 
 class CloudflareTester:
     def __init__(self):
@@ -50,18 +43,18 @@ class CloudflareTester:
         self.lock = threading.Lock()
     
     def fetch_nodes(self):
-        """解析全球网段并采样"""
+        """解析网段样本"""
         print("[*] 正在解析全量网段样本...")
         for cidr in CF_IPV4_RANGES:
             try:
                 net = ipaddress.ip_network(cidr)
-                # 智能采样步长
+                # 采样步长：网段越大，步长越大，避免样本过多
                 if net.num_addresses <= 1024:
                     step = 8
                 elif net.num_addresses <= 65536:
-                    step = 256
+                    step = 128
                 else:
-                    step = 1024
+                    step = 512
                 
                 for i in range(1, net.num_addresses, step):
                     self.nodes.add(str(net[i]))
@@ -96,7 +89,7 @@ class CloudflareTester:
         for ip in self.nodes:
             q.put(ip)
 
-        print(f"[*] 开始测速，线程数: {MAX_THREADS}...")
+        print(f"[*] 开始测速（第一轮：筛选低延迟节点），线程数: {MAX_THREADS}...")
         threads = []
         for _ in range(MAX_THREADS):
             t = threading.Thread(target=self.worker, args=(q,))
@@ -106,30 +99,43 @@ class CloudflareTester:
         
         q.join()
         
-        # 排序
+        # 按照延迟从低到高排序
         sorted_nodes = sorted(self.results, key=lambda x: x['ms'])
         
-        # 识别归属地并保存
-        print(f"[*] 识别前 {TOP_NODES} 个节点的国家信息...")
+        print(f"[*] 开始识别归属地，目标：{TARGET_COUNTRY}，计划收集：{TARGET_COUNT}个...")
         final_data = []
-        for i in range(min(len(sorted_nodes), TOP_NODES)):
-            node = sorted_nodes[i]
-            code, label = get_real_location(node['ip'])
-            node['code'] = code.lower()
-            node['label'] = label
-            final_data.append(node)
-            print(f"Rank {i+1}: {node['ip']} | {node['ms']}ms | {label}")
-            time.sleep(0.3) # 防止API请求过快
+        count = 0
+        
+        # 遍历测速结果，查找符合国家代码的IP
+        for node in sorted_nodes:
+            if count >= TARGET_COUNT:
+                break
+                
+            code = get_real_location(node['ip'])
+            
+            if code == TARGET_COUNTRY:
+                node['code'] = code.lower()
+                node['label'] = "中国台湾"
+                final_data.append(node)
+                count += 1
+                print(f"找到第 {count} 个台湾节点: {node['ip']} | {node['ms']}ms")
+            
+            # 关键：ip-api 免费版有限制，每分钟最多45次
+            # 为了防止被封IP，这里增加一个小延迟，或者如果你有付费Key可以移除
+            time.sleep(1.35) 
 
-        self.save(final_data)
+        if final_data:
+            self.save(final_data)
+        else:
+            print("[!] 未找到符合条件的台湾节点。")
 
     def save(self, data):
         with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
             for n in data:
-                # 按照 IP#code 【国家】 地区代码 格式输出
+                # 格式：IP#code 【国家】 地区代码
                 line = f"{n['ip']}#{n['code']} 【{n['label']}】 {n['code'].upper()}\n"
                 f.write(line)
-        print(f"[*] 成功保存至 {TXT_OUTPUT_FILE}")
+        print(f"[*] 成功保存 {len(data)} 个节点至 {TXT_OUTPUT_FILE}")
 
 if __name__ == "__main__":
     try:
