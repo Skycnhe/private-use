@@ -1,154 +1,111 @@
 import socket
-import re
 import time
-import threading
 import ipaddress
-from queue import Queue
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ================= Cloudflare节点测试配置参数 =================
-TEST_TIMEOUT = 1.5  # 测试超时时间(秒)
-TEST_PORT = 443     # 测试端口
-MAX_THREADS = 100   # 最大线程数
-TOP_NODES = 20      # 显示和保存前N个最快节点
-TXT_OUTPUT_FILE = "JP.txt"    # 结果保存文件
+# ================= 配置参数 =================
+TEST_TIMEOUT = 1.0     # 连接超时时间（秒）
+TEST_PORT = 443        # 测试端口
+MAX_THREADS = 150      # 并发线程数（根据电脑配置可调高）
+TOP_NODES = 20         # 最终保留的优选数量
+TXT_OUTPUT_FILE = "JP.txt" # 修改为 JP.txt
 
-# ================= 辅助函数 =================
-def get_ip_country(ip):
-    """固定返回日本标签"""
-    return '日本'
+# Cloudflare 官方 IPv4 网段 (这些网段在 Anycast 下可能指向全球任何数据中心)
+# 注：对于中国大陆用户，以下网段中 104.16.x.x / 172.64.x.x / 108.162.x.x 
+# 经常能扫出延迟较低的东京 (NRT) 或 大阪 (KIX) 节点。
+CF_IPV4_RANGES = [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
+    '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
+    '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22',
+    '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/12',
+    '172.64.0.0/13', '131.0.72.0/22'
+]
 
-def clean_ip(ip_str):
-    """清理IP字符串"""
-    ip_str = ip_str.strip().rstrip(':')
-    pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
-    if re.match(pattern, ip_str):
-        parts = ip_str.split('.')
-        if all(0 <= int(part) <= 255 for part in parts):
-            return ip_str
-    return None
-
-# ================= Cloudflare节点测试类 =================
-class CloudflareNodeTester:
+class CloudflareScanner:
     def __init__(self):
-        self.nodes = set()  # 存储节点IP
-        self.results = []   # 存储测试结果
-        self.lock = threading.Lock()
-    
-    def fetch_known_nodes(self):
-        """解析CF网段并采样生成IP"""
-        ip_ranges = [
-            '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22',
-            '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
-            '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22',
-            '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
-            '172.64.0.0/13'
-        ]
-        
-        print(f"[*] 正在解析网段采样生成 IP...")
-        for cidr in ip_ranges:
-            try:
-                network = ipaddress.ip_network(cidr)
-                # 根据网段大小自动调整采样步长
-                if network.num_addresses <= 1024:
-                    step = 8
-                elif network.num_addresses <= 65536:
-                    step = 128
-                else:
-                    step = 512
-                
-                hosts = list(network.hosts())
-                for i in range(0, len(hosts), step):
-                    self.nodes.add(str(hosts[i]))
-            except:
-                continue
-        print(f"[*] 采样完成，共生成 {len(self.nodes)} 个待测 IP")
-    
-    def test_node_speed(self, ip):
-        """测试单个节点的连接速度"""
+        self.ips = []
+        self.results = []
+
+    def generate_ips(self):
+        """解析网段并抽样生成待测 IP"""
+        print("[*] 正在解析官方网段并生成样本...")
+        for cidr in CF_IPV4_RANGES:
+            network = ipaddress.ip_network(cidr)
+            # 步进采样：大网段步进更大，防止总数过多
+            if network.num_addresses > 10000:
+                step = 256  # 大型网段每 256 个 IP 取一个
+            elif network.num_addresses > 1024:
+                step = 64   # 中型网段每 64 个 IP 取一个
+            else:
+                step = 16   # 小型网段每 16 个 IP 取一个
+            
+            for i in range(1, network.num_addresses, step):
+                self.ips.append(str(network[i]))
+        print(f"[*] 样本生成完毕，共有 {len(self.ips)} 个测试目标")
+
+    def test_latency(self, ip):
+        """测试 TCP 握手延迟"""
         try:
-            start_time = time.time()
+            start = time.perf_counter()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(TEST_TIMEOUT)
                 result = s.connect_ex((ip, TEST_PORT))
                 if result == 0:
-                    response_time = (time.time() - start_time) * 1000
-                    return {
-                        'ip': ip,
-                        'reachable': True,
-                        'response_time_ms': int(response_time)
-                    }
+                    latency = (time.perf_counter() - start) * 1000
+                    return {"ip": ip, "latency": int(latency)}
         except:
             pass
-        return {'ip': ip, 'reachable': False, 'response_time_ms': None}
-    
-    def worker(self, queue):
-        """线程工作函数"""
-        while not queue.empty():
-            try:
-                ip = queue.get_nowait()
-            except:
-                break
-            result = self.test_node_speed(ip)
-            if result['reachable']:
-                with self.lock:
-                    self.results.append(result)
-            queue.task_done()
-    
-    def test_all_nodes(self):
-        """测试所有节点的速度"""
-        print(f"[*] 启动线程池进行测速 (最大线程: {MAX_THREADS})...")
-        queue = Queue()
-        for ip in self.nodes:
-            queue.put(ip)
+        return None
+
+    def run(self):
+        self.generate_ips()
+        print(f"[*] 开始日本方向测速 (并发线程: {MAX_THREADS})...")
         
-        threads = []
-        for _ in range(min(MAX_THREADS, len(self.nodes))):
-            thread = threading.Thread(target=self.worker, args=(queue,))
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            future_to_ip = {executor.submit(self.test_latency, ip): ip for ip in self.ips}
+            
+            completed = 0
+            for future in as_completed(future_to_ip):
+                res = future.result()
+                if res:
+                    self.results.append(res)
+                
+                completed += 1
+                if completed % 500 == 0:
+                    print(f"    进度: {completed}/{len(self.ips)}...")
+
+        # 按延迟排序（延迟越低越靠前）
+        self.results.sort(key=lambda x: x['latency'])
         
-        for thread in threads:
-            thread.join()
-    
-    def sort_and_display_results(self):
-        """排序并显示测试结果"""
-        sorted_nodes = sorted(self.results, key=lambda x: x['response_time_ms'])
-        print(f"[*] 测速完成，发现响应节点: {len(sorted_nodes)}")
-        for i, node in enumerate(sorted_nodes[:min(10, len(sorted_nodes))], 1):
-            print(f"  {i}. {node['ip']} - {node['response_time_ms']}ms")
-        return sorted_nodes
-    
-    def save_results(self, results):
-        """保存结果到文件"""
+        duration = int(time.time() - start_time)
+        print(f"[*] 测速完成，耗时 {duration} 秒，有效节点 {len(self.results)} 个")
+        self.save_top_nodes()
+
+    def save_top_nodes(self):
+        """保存为 JP 格式"""
+        count = min(len(self.results), TOP_NODES)
+        if count == 0:
+            print("[!] 未发现可用节点，请检查网络环境。")
+            return
+
         try:
-            top_results = results[:TOP_NODES]
-            with open(TXT_OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                for node in top_results:
+            with open(TXT_OUTPUT_FILE, "w", encoding="utf-8") as f:
+                for i in range(count):
+                    node = self.results[i]
+                    # 修改为 JP 格式标识
                     f.write(f"{node['ip']}#jp 【日本】 JP\n")
-            print(f"[*] 结果已成功保存到 {TXT_OUTPUT_FILE}")
+            
+            print(f"[*] 结果已保存至 {TXT_OUTPUT_FILE}")
+            print("\n延迟最低的前 5 个日本方向节点:")
+            for i in range(min(5, count)):
+                print(f"  {self.results[i]['ip']} - {self.results[i]['latency']}ms")
         except Exception as e:
             print(f"[!] 保存失败: {e}")
 
-# ================= 动态绑定 run 方法 =================
-def run_cloudflare_tester(self):
-    """运行流程"""
-    start_time = time.time()
-    self.fetch_known_nodes()
-    self.test_all_nodes()
-    sorted_nodes = self.sort_and_display_results()
-    self.save_results(sorted_nodes)
-    print(f"[*] 脚本总耗时: {int(time.time() - start_time)} 秒")
-
-CloudflareNodeTester.run = run_cloudflare_tester
-
-# ================= 主入口 =================
 if __name__ == "__main__":
+    scanner = CloudflareScanner()
     try:
-        tester = CloudflareNodeTester()
-        tester.run()
+        scanner.run()
     except KeyboardInterrupt:
-        print("\n[!] 用户中断程序")
-    except Exception as e:
-        print(f"\n[!] 运行出错: {e}")
+        print("\n[!] 用户停止")
